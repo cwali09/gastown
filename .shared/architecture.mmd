@@ -1,0 +1,29 @@
+graph TB
+    CLI[gt CLI<br/>cmd/gt/main.go]
+    Internal[internal/<br/>Core packages]
+
+    CLI --> CmdPkg[cmd/ handlers]
+    CmdPkg --> Internal
+
+    Internal --> Town[town/<br/>Workspace manager]
+    Internal --> Rig[rig/<br/>Project containers]
+    Internal --> Polecat[polecat/<br/>Worker agents]
+    Internal --> Hooks[hooks/<br/>Git worktree storage]
+    Internal --> Beads[beads/<br/>Issue tracking]
+    Internal --> Mayor[mayor/<br/>AI coordinator]
+    Internal --> Convoy[convoy/<br/>Work batching]
+    Internal --> Witness[witness/<br/>Agent monitoring]
+    Internal --> Deacon[deacon/<br/>Background supervisor]
+    Internal --> Refinery[refinery/<br/>Merge queue]
+    Internal --> Molecules[molecules/<br/>Workflow templates]
+
+    Rig --> Hooks
+    Rig --> Polecat
+    Polecat --> Beads
+    Convoy --> Beads
+    Witness --> Polecat
+    Deacon --> Witness
+    Refinery --> Rig
+
+    style CLI fill:#e1f5ff,color:#000
+    style Internal fill:#f0f0f0,color:#000
