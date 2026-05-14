@@ -179,6 +179,19 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	// the correct work attribution until the next gt prime overwrites it.
 	hookedBead, hookErr := findAgentWork(ctx)
 	if hookErr != nil {
+		// Cross-rig / unresolvable hook bead (gt-el4): the agent bead names a
+		// hook bead that bd show cannot find. Don't sit idle "pontificating" —
+		// emit a clear message, fire a HIGH escalation so the witness sees the
+		// dead-with-active-work state, and exit non-zero so the dog can clear
+		// the hook on its next sweep.
+		if errors.Is(hookErr, ErrHookUnresolvable) {
+			agentID := getAgentIdentity(ctx)
+			fmt.Fprintf(os.Stderr,
+				"polecat prime: hooked bead not resolvable from %s; check rig DB / dispatch routing. err=%v\n",
+				ctx.WorkDir, hookErr)
+			firePolecatHookUnresolvableEscalation(agentID, hookErr.Error())
+			return fmt.Errorf("polecat prime: hook unresolvable: %w", hookErr)
+		}
 		// Database error during hook query — NOT the same as "no work assigned".
 		// Emit a loud warning so the agent does NOT run gt done / close the bead.
 		// This prevents the destructive cycle: DB error → "no work" → gt done → bead lost. (GH#2638)
@@ -390,7 +403,14 @@ func setupPrimeSession(ctx RoleContext, roleInfo RoleInfo) error {
 		ensureBeadsRedirect(ctx)
 	}
 	repairSessionEnv(ctx, roleInfo)
-	emitSessionEvent(ctx)
+	// Only emit session_start when gt prime is running as a SessionStart or
+	// PreCompact hook. Bare gt prime calls (e.g. an agent reading another
+	// agent's context) must not emit session_start — doing so logs a spurious
+	// event with the target agent's persisted session_id, which pollutes the
+	// event stream and can confuse gt seance discovery.
+	if primeHookMode {
+		emitSessionEvent(ctx)
+	}
 	return nil
 }
 
@@ -533,7 +553,7 @@ var memoryTypeLabels = map[string]string{
 	"feedback":  "Behavioral Rules (from user feedback)",
 	"user":      "User Context",
 	"project":   "Project Context",
-	"reference":  "Reference Links",
+	"reference": "Reference Links",
 	"general":   "General",
 }
 
@@ -699,10 +719,41 @@ func findAgentWork(ctx RoleContext) (*beads.Issue, error) {
 	return nil, lastErr
 }
 
+// ErrHookUnresolvable signals that the agent bead points at a hook bead that
+// cannot be resolved from the agent's CWD (e.g., cross-rig dispatch where an
+// `hq-` bead was handed to a `gt-` rig polecat). See gt-el4.
+var ErrHookUnresolvable = errors.New("hooked bead not resolvable from this rig")
+
+// isBeadNotFound reports whether an error from beads.Show represents a missing
+// bead (as opposed to a connectivity / auth / parsing error). Heuristic match
+// on the canonical "no issue found" / "not found" markers bd surfaces.
+func isBeadNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no issue found") ||
+		strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "issue not found")
+}
+
+// firePolecatHookUnresolvableEscalation fires a HIGH escalation so the witness
+// sees the dead-with-active-work state immediately. Best effort — logged on
+// failure but does not gate the prime exit.
+var firePolecatHookUnresolvableEscalation = func(agentID, detail string) {
+	msg := fmt.Sprintf("polecat hook unresolvable: agent=%s detail=%s — see gt-el4", agentID, detail)
+	cmd := exec.Command("gt", "escalate", "--severity", "high", "--reason", "polecat-hook-unresolvable", msg)
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "polecat prime: escalation failed: %v\n", err)
+	}
+}
+
 // findAgentWorkOnce performs a single attempt to find hooked work for an agent.
 // Returns (nil, nil) when no work is found.
 // Returns (nil, err) when the database query itself failed — the caller must
 // not treat this as "no work assigned". (GH#2638)
+// Returns (nil, ErrHookUnresolvable) when the agent bead points at a hook bead
+// that cannot be resolved — the polecat must fail fast rather than pontificate.
 func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 	// Use rig root for beads queries instead of ctx.WorkDir. Polecat worktrees
 	// rely on .beads/redirect which can fail to resolve in edge cases, causing
@@ -720,9 +771,19 @@ func findAgentWorkOnce(ctx RoleContext, agentID string) (*beads.Issue, error) {
 		if agentBead, err := ab.Show(agentBeadID); err == nil && agentBead != nil && agentBead.HookBead != "" {
 			hookBeadDir := beads.ResolveHookDir(ctx.TownRoot, agentBead.HookBead, ctx.WorkDir)
 			hb := beads.New(hookBeadDir)
-			if hookBead, err := hb.Show(agentBead.HookBead); err == nil && hookBead != nil &&
+			hookBead, showErr := hb.Show(agentBead.HookBead)
+			if showErr == nil && hookBead != nil &&
 				(hookBead.Status == beads.StatusHooked || hookBead.Status == "in_progress") {
 				return hookBead, nil
+			}
+			// The agent bead names a hook bead but `bd show` cannot find it.
+			// This is the cross-rig dispatch failure mode (gt-el4): an `hq-`
+			// bead was handed to a polecat whose DB only resolves `gt-`. Fail
+			// fast — never pontificate, the witness will clear the hook on
+			// its next sweep and the dispatcher will (or won't) re-issue.
+			if hookBead == nil || isBeadNotFound(showErr) {
+				return nil, fmt.Errorf("%w: agent=%s hook_bead=%s cwd=%s: %v",
+					ErrHookUnresolvable, agentID, agentBead.HookBead, ctx.WorkDir, showErr)
 			}
 		}
 	}
@@ -893,7 +954,7 @@ func outputMoleculeWorkflow(ctx RoleContext, attachment *beads.AttachmentFields)
 
 	// Show inline formula steps from the embedded binary (root-only: no child wisps to query).
 	if attachment.AttachedFormula != "" {
-		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, strings.Split(attachment.FormulaVars, "\n"))
+		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, attachmentFormulaVars(attachment))
 		fmt.Println()
 		fmt.Printf("%s\n", style.Bold.Render("Work through ALL steps above, including submit and cleanup."))
 		fmt.Println("The base bead is your assignment. The formula steps define your workflow.")
@@ -925,7 +986,7 @@ func outputRalphLoopDirective(ctx RoleContext, attachment *beads.AttachmentField
 	// the full checklist. Previously this emitted a /ralph-loop slash command
 	// that didn't exist, causing the polecat to die immediately.
 	if attachment.AttachedFormula != "" {
-		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, strings.Split(attachment.FormulaVars, "\n"))
+		showFormulaStepsFull(attachment.AttachedFormula, ctx.TownRoot, ctx.Rig, attachmentFormulaVars(attachment))
 		fmt.Println()
 	}
 
@@ -1123,14 +1184,20 @@ func getAgentBeadID(ctx RoleContext) string {
 // Uses the shared SetupRedirect helper which handles both tracked and local beads.
 func ensureBeadsRedirect(ctx RoleContext) {
 	// Only applies to worktree-based roles that use shared beads
-	if ctx.Role != RoleCrew && ctx.Role != RolePolecat && ctx.Role != RoleRefinery {
+	if ctx.Role != RoleCrew && ctx.Role != RolePolecat && ctx.Role != RoleRefinery && ctx.Role != RoleWitness {
 		return
 	}
 
-	// Check if redirect already exists
 	redirectPath := filepath.Join(ctx.WorkDir, ".beads", "redirect")
-	if _, err := os.Stat(redirectPath); err == nil {
-		return // Redirect exists, nothing to do
+	expected, err := beads.ComputeRedirectTarget(ctx.TownRoot, ctx.WorkDir)
+	if err != nil {
+		// Preserve the old best-effort behavior: if target computation fails but
+		// a redirect exists, do not disturb the worktree during prime.
+		if _, statErr := os.Stat(redirectPath); statErr == nil {
+			return
+		}
+	} else if data, readErr := os.ReadFile(redirectPath); readErr == nil && strings.TrimSpace(string(data)) == expected {
+		return
 	}
 
 	// Use shared helper - silently ignore errors during prime

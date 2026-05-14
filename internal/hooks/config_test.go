@@ -913,6 +913,54 @@ func TestDiscoverTargets_ReturnsOnlyClaude(t *testing.T) {
 	}
 }
 
+func TestDiscoverTargets_BootIncluded(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	os.MkdirAll(filepath.Join(tmpDir, "mayor"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "deacon", "dogs", "boot"), 0755)
+
+	targets, err := DiscoverTargets(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverTargets failed: %v", err)
+	}
+
+	found := false
+	for _, tgt := range targets {
+		if tgt.Key == "boot" {
+			found = true
+			wantPath := filepath.Join(tmpDir, "deacon", "dogs", "boot", ".claude", "settings.json")
+			if tgt.Path != wantPath {
+				t.Errorf("boot target Path = %q, want %q", tgt.Path, wantPath)
+			}
+			if tgt.Role != "boot" {
+				t.Errorf("boot target Role = %q, want %q", tgt.Role, "boot")
+			}
+		}
+	}
+	if !found {
+		t.Error("expected boot target when deacon/dogs/boot/ exists, not found")
+	}
+}
+
+func TestDiscoverTargets_BootAbsent(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	os.MkdirAll(filepath.Join(tmpDir, "mayor"), 0755)
+	os.MkdirAll(filepath.Join(tmpDir, "deacon"), 0755)
+	// No deacon/dogs/boot directory
+
+	targets, err := DiscoverTargets(tmpDir)
+	if err != nil {
+		t.Fatalf("DiscoverTargets failed: %v", err)
+	}
+
+	for _, tgt := range targets {
+		if tgt.Key == "boot" {
+			t.Errorf("expected no boot target when deacon/dogs/boot/ absent, got one: %+v", tgt)
+		}
+	}
+}
+
 func TestDiscoverRoleLocations(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -1017,6 +1065,36 @@ func TestDiscoverWorktrees_EmptyDir(t *testing.T) {
 	dirs := DiscoverWorktrees(tmpDir)
 	if len(dirs) != 0 {
 		t.Errorf("expected 0 worktrees, got %d", len(dirs))
+	}
+}
+
+func TestDiscoverWorktrees_PrefersNestedGitWorktreeRoots(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	worktree := filepath.Join(tmpDir, "fury", "gastown")
+	if err := os.MkdirAll(filepath.Join(worktree, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "dust"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	dirs := DiscoverWorktrees(tmpDir)
+
+	if len(dirs) != 2 {
+		t.Fatalf("expected 2 worktrees, got %d: %v", len(dirs), dirs)
+	}
+
+	got := make(map[string]bool)
+	for _, dir := range dirs {
+		got[dir] = true
+	}
+
+	if !got[worktree] {
+		t.Fatalf("expected nested worktree root %q, got %v", worktree, dirs)
+	}
+	if !got[filepath.Join(tmpDir, "dust")] {
+		t.Fatalf("expected direct worktree fallback %q, got %v", filepath.Join(tmpDir, "dust"), dirs)
 	}
 }
 

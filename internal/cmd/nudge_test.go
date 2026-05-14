@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -304,6 +305,10 @@ func TestNudgeValidModesAccepted(t *testing.T) {
 		waitIdleTimeout = origTimeout
 	}()
 
+	// Route nudge transport to a log file so the test doesn't deliver "test"
+	// messages to live agents (mayor reported recurring synthetic nudges).
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+
 	// Shorten wait-idle timeout to avoid 15s test delay
 	waitIdleTimeout = 200 * time.Millisecond
 
@@ -441,6 +446,45 @@ func TestIdleWatcherPollInterval(t *testing.T) {
 	}
 	if idleWatcherPollInterval > 5*time.Second {
 		t.Errorf("idleWatcherPollInterval = %v, too slow (max 5s)", idleWatcherPollInterval)
+	}
+}
+
+func TestNudgeTrailingSlashNormalization(t *testing.T) {
+	// The mail system uses "mayor/" and "deacon/" as canonical addresses.
+	// runNudge must strip the trailing slash so these match the role shortcuts.
+	// Without normalization, "mayor/" falls through to parseAddress which
+	// rejects it ("invalid address format"), silently dropping the nudge.
+	origMode := nudgeModeFlag
+	origPriority := nudgePriorityFlag
+	origMessage := nudgeMessageFlag
+	origStdin := nudgeStdinFlag
+	origTimeout := waitIdleTimeout
+	defer func() {
+		nudgeModeFlag = origMode
+		nudgePriorityFlag = origPriority
+		nudgeMessageFlag = origMessage
+		nudgeStdinFlag = origStdin
+		waitIdleTimeout = origTimeout
+	}()
+
+	// Route nudge transport to a log file so this test doesn't deliver to
+	// the real mayor/deacon/witness/refinery sessions on host.
+	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
+
+	waitIdleTimeout = 200 * time.Millisecond
+	nudgeStdinFlag = false
+	nudgeMessageFlag = "test"
+	nudgePriorityFlag = "normal"
+	nudgeModeFlag = NudgeModeImmediate
+
+	for _, target := range []string{"mayor/", "deacon/", "witness/", "refinery/"} {
+		t.Run(target, func(t *testing.T) {
+			err := runNudge(nudgeCmd, []string{target, "hello"})
+			// Will fail on tmux/session lookup, but must NOT fail on address parsing.
+			if err != nil && strings.Contains(err.Error(), "invalid address format") {
+				t.Errorf("trailing-slash target %q was rejected as invalid address: %v", target, err)
+			}
+		})
 	}
 }
 

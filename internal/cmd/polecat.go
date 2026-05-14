@@ -18,6 +18,7 @@ import (
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
+	"github.com/steveyegge/gastown/internal/workspace"
 )
 
 // Polecat command flags
@@ -400,8 +401,11 @@ func effectivePolecatState(item PolecatListItem) polecat.State {
 	if item.SessionRunning && (state == polecat.StateDone || state == polecat.StateIdle) {
 		return polecat.StateWorking
 	}
+	// When session is dead but beads still says "working", mark as stalled
+	// (not done — work was interrupted, not completed). The manager's loadFromBeads
+	// now returns StateStalled for this case, but list reconciliation may override.
 	if !item.SessionRunning && !item.Zombie && state == polecat.StateWorking {
-		return polecat.StateDone
+		return polecat.StateStalled
 	}
 	return state
 }
@@ -524,6 +528,8 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 			stateStr = style.Info.Render(stateStr)
 		case polecat.StateStuck:
 			stateStr = style.Warning.Render(stateStr)
+		case polecat.StateStalled:
+			stateStr = style.Error.Render(stateStr)
 		case polecat.StateDone:
 			stateStr = style.Success.Render(stateStr)
 		case polecat.StateZombie:
@@ -713,6 +719,8 @@ func runPolecatStatus(cmd *cobra.Command, args []string) error {
 		stateStr = style.Info.Render(stateStr)
 	case polecat.StateStuck:
 		stateStr = style.Warning.Render(stateStr)
+	case polecat.StateStalled:
+		stateStr = style.Error.Render(stateStr)
 	case polecat.StateDone:
 		stateStr = style.Success.Render(stateStr)
 	default:
@@ -1029,20 +1037,16 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	// verify the work was actually submitted to the merge queue.
 	// Without this check, polecats that crashed between push and MQ submission
 	// would be nuked with orphaned branches on the remote. See #1035.
+	//
+	// Exception: if the polecat's assigned bead is already CLOSED/TOMBSTONE,
+	// the work is terminal and MQ submission is moot. Reporting NEEDS_MQ_SUBMIT
+	// on a closed bead triggered a zombie-restart loop (see aa-55d8): witness
+	// patrols kept auto-restarting the polecat to "finish" work that was already
+	// done, which just ran `gt done` again and died, over and over.
 	if status.Verdict == "SAFE_TO_NUKE" && status.Branch != "" {
 		mqBd := beads.New(r.Path)
-		mr, mrErr := mqBd.FindMRForBranchAny(status.Branch)
-		if mrErr != nil {
-			// Can't verify MQ — be conservative
-			status.MQStatus = "unknown"
-		} else if mr != nil {
-			status.MQStatus = "submitted"
-		} else {
-			// Work was pushed but never entered the merge queue
-			status.MQStatus = "not_submitted"
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_MQ_SUBMIT"
-		}
+		beadTerminal := isAssignedBeadTerminal(mqBd, status.Issue)
+		applyMQCheck(&status, mqBd, beadTerminal)
 	}
 
 	// JSON output
@@ -1085,6 +1089,56 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// mrFinder is the subset of *beads.Beads that applyMQCheck needs. It lets us
+// unit-test the verdict logic without a real bd binary.
+type mrFinder interface {
+	FindMRForBranchAny(branch string) (*beads.Issue, error)
+}
+
+// isAssignedBeadTerminal reports whether the polecat's assigned bead (if any)
+// is in a terminal status (closed/tombstone). Returns false on any lookup
+// failure — callers must only use this to *skip* further escalation, never to
+// escalate, so a false negative is safe.
+func isAssignedBeadTerminal(bd *beads.Beads, issueID string) bool {
+	if issueID == "" || bd == nil {
+		return false
+	}
+	issue, err := bd.Show(issueID)
+	if err != nil || issue == nil {
+		return false
+	}
+	return beads.IssueStatus(issue.Status).IsTerminal()
+}
+
+// applyMQCheck mutates status based on merge-queue state for the polecat's
+// branch. If beadTerminal is true, the assigned bead is already closed, so
+// there is nothing to submit and we leave the verdict as SAFE_TO_NUKE.
+//
+// This guard fixes the zombie-restart loop documented in bead aa-55d8:
+// a closed "no-op audit" bead (e.g. aa-xtee) used to report NEEDS_MQ_SUBMIT
+// forever, causing witness patrols to restart the polecat on every cycle.
+func applyMQCheck(status *RecoveryStatus, bd mrFinder, beadTerminal bool) {
+	if beadTerminal {
+		// Nothing to submit — the bead is already terminal.
+		status.MQStatus = "submitted"
+		return
+	}
+	mr, mrErr := bd.FindMRForBranchAny(status.Branch)
+	if mrErr != nil {
+		// Can't verify MQ — be conservative
+		status.MQStatus = "unknown"
+		return
+	}
+	if mr != nil {
+		status.MQStatus = "submitted"
+		return
+	}
+	// Work was pushed but never entered the merge queue
+	status.MQStatus = "not_submitted"
+	status.NeedsRecovery = true
+	status.Verdict = "NEEDS_MQ_SUBMIT"
 }
 
 func runPolecatGC(cmd *cobra.Command, args []string) error {
@@ -1761,8 +1815,13 @@ func runPolecatPoolInit(cmd *cobra.Command, args []string) error {
 			fmt.Printf(" %s %v\n", style.Warning.Render("FAILED"), addErr)
 			continue
 		}
-		// Set agent state to idle (polecat was created without work)
-		if stateErr := mgr.SetAgentState(name, "idle"); stateErr != nil {
+		// Set agent state to idle (polecat was created without work).
+		// Use the retry variant: createAgentBeadWithRetry above leaves a brief
+		// Dolt MVCC visibility window where the just-committed bead isn't yet
+		// readable by the next UpdateAgentState query, surfacing as "issue not
+		// found". Retries with backoff close that window — same pattern as
+		// SetAgentStateWithRetry's other call site in polecat_spawn.go.
+		if stateErr := mgr.SetAgentStateWithRetry(name, "idle"); stateErr != nil {
 			fmt.Printf(" %s (created but couldn't set idle state: %v)\n", style.Warning.Render("⚠"), stateErr)
 		} else {
 			fmt.Printf(" %s (%s)\n", style.Success.Render("✓"), style.Dim.Render(p.ClonePath))
@@ -1772,6 +1831,16 @@ func runPolecatPoolInit(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("\n%s Pool initialized: %d created, %d total (target: %d)\n",
 		style.Bold.Render("✓"), created, created+len(existing), poolSize)
+
+	// Sync hooks so all polecat settings.json files reflect current defaults.
+	// Pool-init may run long after rig-add, when gt defaults have changed.
+	townRoot, twErr := workspace.FindFromCwdOrError()
+	if twErr == nil {
+		ensureHooksBase()
+		if err := syncRigHooks(townRoot, rigName); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to sync hooks after pool-init: %v\n", err)
+		}
+	}
 
 	return nil
 }

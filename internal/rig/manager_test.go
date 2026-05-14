@@ -135,6 +135,43 @@ func TestDiscoverRigs(t *testing.T) {
 	}
 }
 
+func TestDiscoverRigs_SortedByName(t *testing.T) {
+	root, rigsConfig := setupTestTown(t)
+
+	// Register rigs in deliberately non-alphabetical order.
+	// Go map iteration is randomized, so without sorting the output
+	// order would be nondeterministic across runs.
+	names := []string{"zebra", "alpha", "middle", "beta"}
+	for _, name := range names {
+		createTestRig(t, root, name)
+		rigsConfig.Rigs[name] = config.RigEntry{
+			GitURL: "git@github.com:test/" + name + ".git",
+		}
+	}
+
+	manager := NewManager(root, rigsConfig, git.NewGit(root))
+
+	// Run multiple iterations to catch nondeterminism — a single pass
+	// could accidentally return sorted order from a random map.
+	for i := 0; i < 10; i++ {
+		rigs, err := manager.DiscoverRigs()
+		if err != nil {
+			t.Fatalf("DiscoverRigs (iter %d): %v", i, err)
+		}
+
+		if len(rigs) != len(names) {
+			t.Fatalf("iter %d: rigs count = %d, want %d", i, len(rigs), len(names))
+		}
+
+		want := []string{"alpha", "beta", "middle", "zebra"}
+		for j, rig := range rigs {
+			if rig.Name != want[j] {
+				t.Errorf("iter %d: rigs[%d].Name = %q, want %q", i, j, rig.Name, want[j])
+			}
+		}
+	}
+}
+
 func TestGetRig(t *testing.T) {
 	root, rigsConfig := setupTestTown(t)
 
@@ -553,6 +590,50 @@ exit 0
 	}
 }
 
+func TestInitBeadsPassesCanonicalDatabase(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake bd arg/env logging is shell-specific")
+	}
+
+	rigPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rigPath, "mayor", "rig"), 0755); err != nil {
+		t.Fatalf("mkdir mayor/rig: %v", err)
+	}
+
+	cmdLog := filepath.Join(t.TempDir(), "bd-cmds.log")
+	script := `#!/usr/bin/env bash
+set -e
+printf 'args=%s env=%s beads=%s db=%s\n' "$*" "${BEADS_DOLT_SERVER_DATABASE:-<unset>}" "${BEADS_DIR:-<unset>}" "${BEADS_DB:-<unset>}" >> "$BD_CMD_LOG"
+exit 0
+`
+	binDir := writeFakeBD(t, script, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_CMD_LOG", cmdLog)
+	t.Setenv("BEADS_DIR", filepath.Join(rigPath, "wrong", ".beads"))
+	t.Setenv("BEADS_DB", filepath.Join(rigPath, "wrong.db"))
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "stale_prefix_db")
+
+	manager := &Manager{}
+	if err := manager.InitBeads(rigPath, "xx", "my_project"); err != nil {
+		t.Fatalf("InitBeads: %v", err)
+	}
+
+	logData, err := os.ReadFile(cmdLog)
+	if err != nil {
+		t.Fatalf("reading command log: %v", err)
+	}
+	cmds := string(logData)
+	if !strings.Contains(cmds, "args=init --prefix xx --database my_project --server") {
+		t.Fatalf("bd init did not use canonical database; log:\n%s", cmds)
+	}
+	if strings.Contains(cmds, "env=stale_prefix_db") || strings.Contains(cmds, "wrong.db") || strings.Contains(cmds, filepath.Join(rigPath, "wrong", ".beads")) {
+		t.Fatalf("stale BEADS env leaked into bd subprocess; log:\n%s", cmds)
+	}
+	if !strings.Contains(cmds, "env=my_project") {
+		t.Fatalf("bd subprocess did not receive canonical database env; log:\n%s", cmds)
+	}
+}
+
 func TestInitAgentBeadsUsesRigBeadsDir(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake bd stub is not compatible with multiline descriptions on Windows")
@@ -697,6 +778,110 @@ func TestIsValidBeadsPrefix(t *testing.T) {
 				t.Errorf("isValidBeadsPrefix(%q) = %v, want %v", tt.prefix, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestDropRigOrphanDBs_RemovesPrefixDB is the regression test for gh#3562.
+//
+// `bd init --prefix <prefix> --server` creates a Dolt database whose name
+// matches the prefix exactly (e.g. "ma" for prefix=ma) on bd >= 0.62. The rig
+// uses <rigName> as its canonical database, so the prefix-named DB is an
+// orphan that must be removed — otherwise beads created from the rig land in
+// the orphan while the mayor reads from <rigName>, silently splitting the data.
+//
+// This test simulates the post-init filesystem state, runs the orphan dropper,
+// and asserts that exactly one rig database remains on disk.
+func TestDropRigOrphanDBs_RemovesPrefixDB(t *testing.T) {
+	// Disable the running-server check so RemoveDatabase falls through to
+	// pure filesystem cleanup. Pointing GT_DOLT_PORT at a definitely-unused
+	// port keeps the test independent of any real Dolt server on the host.
+	t.Setenv("GT_DOLT_PORT", "1") // privileged port, definitely not running dolt
+
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+
+	const rigName = "mobile_apps"
+	const prefix = "ma"
+
+	// Simulate post-init state: rigName DB (correct) and prefix DB (orphan).
+	for _, db := range []string{rigName, prefix} {
+		doltDir := filepath.Join(dataDir, db, ".dolt")
+		if err := os.MkdirAll(doltDir, 0755); err != nil {
+			t.Fatalf("seed %s: %v", db, err)
+		}
+	}
+
+	if err := dropRigOrphanDBs(townRoot, prefix, rigName); err != nil {
+		t.Fatalf("dropRigOrphanDBs: %v", err)
+	}
+
+	// Orphan must be gone.
+	if _, err := os.Stat(filepath.Join(dataDir, prefix)); !os.IsNotExist(err) {
+		t.Errorf("prefix DB %q should have been removed; stat err = %v", prefix, err)
+	}
+
+	// Canonical rig DB must remain.
+	if _, err := os.Stat(filepath.Join(dataDir, rigName, ".dolt")); err != nil {
+		t.Errorf("rig DB %q should be preserved; stat err = %v", rigName, err)
+	}
+}
+
+// TestDropRigOrphanDBs_RemovesLegacyBeadsPrefixDB covers the bd < 0.62
+// naming convention where bd init created "beads_<prefix>" instead of
+// "<prefix>". Both forms must be cleaned up to keep older workspaces
+// functional after upgrade.
+func TestDropRigOrphanDBs_RemovesLegacyBeadsPrefixDB(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+
+	const rigName = "mobile_apps"
+	const prefix = "ma"
+	const legacyOrphan = "beads_ma"
+
+	for _, db := range []string{rigName, legacyOrphan} {
+		if err := os.MkdirAll(filepath.Join(dataDir, db, ".dolt"), 0755); err != nil {
+			t.Fatalf("seed %s: %v", db, err)
+		}
+	}
+
+	if err := dropRigOrphanDBs(townRoot, prefix, rigName); err != nil {
+		t.Fatalf("dropRigOrphanDBs: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dataDir, legacyOrphan)); !os.IsNotExist(err) {
+		t.Errorf("legacy orphan %q should have been removed; stat err = %v", legacyOrphan, err)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, rigName, ".dolt")); err != nil {
+		t.Errorf("rig DB %q should be preserved; stat err = %v", rigName, err)
+	}
+}
+
+// TestDropRigOrphanDBs_PreservesRigDB is the safety check that the helper
+// never removes a database whose name happens to match the prefix when the
+// rig itself is named after its prefix (e.g. rig "gastown" with prefix "gt"
+// where neither candidate is an orphan).
+func TestDropRigOrphanDBs_PreservesRigDB(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "1")
+
+	townRoot := t.TempDir()
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+
+	// Pathological case: rigName == prefix. Nothing should be dropped.
+	const rigName = "gt"
+	const prefix = "gt"
+
+	if err := os.MkdirAll(filepath.Join(dataDir, rigName, ".dolt"), 0755); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := dropRigOrphanDBs(townRoot, prefix, rigName); err != nil {
+		t.Fatalf("dropRigOrphanDBs: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dataDir, rigName, ".dolt")); err != nil {
+		t.Errorf("rig DB %q must be preserved when prefix == rigName; stat err = %v", rigName, err)
 	}
 }
 
@@ -900,8 +1085,18 @@ func TestConvertToSSH(t *testing.T) {
 			wantSSH: "git@gitlab.com:owner/repo.git",
 		},
 		{
-			name:    "Unknown host returns empty",
+			name:    "Bitbucket with .git suffix",
 			https:   "https://bitbucket.org/owner/repo.git",
+			wantSSH: "git@bitbucket.org:owner/repo.git",
+		},
+		{
+			name:    "Bitbucket without .git suffix",
+			https:   "https://bitbucket.org/owner/repo",
+			wantSSH: "git@bitbucket.org:owner/repo.git",
+		},
+		{
+			name:    "Unknown host returns empty",
+			https:   "https://gitlab.example.com/owner/repo.git",
 			wantSSH: "",
 		},
 		{

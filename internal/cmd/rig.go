@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -295,31 +296,31 @@ Examples:
 
 // Flags
 var (
-	rigAddPrefix       string
-	rigAddLocalRepo    string
-	rigAddBranch       string
-	rigAddPushURL      string
-	rigAddUpstreamURL  string
-	rigAddAdopt           bool
+	rigAddPrefix         string
+	rigAddLocalRepo      string
+	rigAddBranch         string
+	rigAddPushURL        string
+	rigAddUpstreamURL    string
+	rigAddAdopt          bool
 	rigAddAdoptURL       string
 	rigAddAdoptForce     bool
 	rigAddFilter         string
 	rigAddSparseCheckout []string
-	rigResetHandoff    bool
-	rigResetMail       bool
-	rigResetStale      bool
-	rigResetDryRun     bool
-	rigResetRole       string
-	rigShutdownForce   bool
-	rigShutdownNuclear bool
-	rigRebootForce     bool
-	rigRebootNuclear   bool
-	rigStopForce       bool
-	rigStopNuclear     bool
-	rigRestartForce    bool
-	rigRestartNuclear  bool
-	rigListJSON        bool
-	rigRemoveForce     bool
+	rigResetHandoff      bool
+	rigResetMail         bool
+	rigResetStale        bool
+	rigResetDryRun       bool
+	rigResetRole         string
+	rigShutdownForce     bool
+	rigShutdownNuclear   bool
+	rigRebootForce       bool
+	rigRebootNuclear     bool
+	rigStopForce         bool
+	rigStopNuclear       bool
+	rigRestartForce      bool
+	rigRestartNuclear    bool
+	rigListJSON          bool
+	rigRemoveForce       bool
 )
 
 var (
@@ -573,11 +574,7 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("adding rig: %w", err)
 	}
-
-	// Save updated rigs config
-	if err := config.SaveRigsConfig(rigsPath, rigsConfig); err != nil {
-		return fmt.Errorf("saving rigs config: %w", err)
-	}
+	// rigs.json is saved atomically inside AddRig; no separate save needed here.
 
 	// Add new rig to daemon.json patrol config (witness + refinery rigs arrays)
 	if err := config.AddRigToDaemonPatrols(townRoot, name); err != nil {
@@ -639,6 +636,9 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 
 	// Auto-assign a namepool theme that doesn't collide with other rigs (gas-21k).
 	autoAssignNamepoolTheme(townRoot, name, mgr)
+
+	// Ensure hooks-base.json exists before syncing (needed for gt hooks diff).
+	ensureHooksBase()
 
 	// Sync hooks for the new rig's targets
 	if err := syncRigHooks(townRoot, name); err != nil {
@@ -1361,6 +1361,12 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 	// Auto-assign a namepool theme that doesn't collide with other rigs (gas-21k).
 	autoAssignNamepoolTheme(townRoot, name, mgr)
 
+	// Ensure hooks-base.json exists and sync hooks for the adopted rig.
+	ensureHooksBase()
+	if err := syncRigHooks(townRoot, name); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to sync hooks for adopted rig: %v\n", err)
+	}
+
 	// Print results
 	fmt.Printf("\n%s Rig %s adopted\n", style.Success.Render("✓"), name)
 	if result.FromConfig {
@@ -1575,6 +1581,10 @@ func pathExists(path string) bool {
 	return err == nil
 }
 
+func isAgentSessionHealthy(t *tmux.Tmux, sessionName string) bool {
+	return t.CheckSessionHealth(sessionName, 0) == tmux.SessionHealthy
+}
+
 func runRigBoot(cmd *cobra.Command, args []string) error {
 	rigName := args[0]
 
@@ -1608,40 +1618,29 @@ func runRigBoot(cmd *cobra.Command, args []string) error {
 	var started []string
 	var skipped []string
 
-	t := tmux.NewTmux()
-
 	// 1. Start the witness
-	// Check actual tmux session, not state file (may be stale)
-	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
-	witnessRunning, _ := t.HasSession(witnessSession)
-	if witnessRunning {
-		skipped = append(skipped, "witness (already running)")
-	} else {
-		fmt.Printf("  Starting witness...\n")
-		witMgr := witness.NewManager(r)
-		if err := witMgr.Start(false, "", nil); err != nil {
-			if err == witness.ErrAlreadyRunning {
-				skipped = append(skipped, "witness (already running)")
-			} else {
-				return fmt.Errorf("starting witness: %w", err)
-			}
+	// Start() treats healthy sessions as already running and recreates zombie
+	// sessions whose tmux pane remains after the agent exits.
+	witMgr := witness.NewManager(r)
+	if err := witMgr.Start(false, "", nil); err != nil {
+		if err == witness.ErrAlreadyRunning {
+			skipped = append(skipped, "witness (already running)")
 		} else {
-			started = append(started, "witness")
+			return fmt.Errorf("starting witness: %w", err)
 		}
+	} else {
+		started = append(started, "witness")
 	}
 
 	// 2. Start the refinery
-	// Check actual tmux session, not state file (may be stale)
-	refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
-	refineryRunning, _ := t.HasSession(refinerySession)
-	if refineryRunning {
-		skipped = append(skipped, "refinery (already running)")
-	} else {
-		fmt.Printf("  Starting refinery...\n")
-		refMgr := refinery.NewManager(r)
-		if err := refMgr.Start(false, ""); err != nil { // false = background mode
+	refMgr := refinery.NewManager(r)
+	if err := refMgr.Start(false, ""); err != nil { // false = background mode
+		if err == refinery.ErrAlreadyRunning {
+			skipped = append(skipped, "refinery (already running)")
+		} else {
 			return fmt.Errorf("starting refinery: %w", err)
 		}
+	} else {
 		started = append(started, "refinery")
 	}
 
@@ -1672,7 +1671,6 @@ func runRigStart(cmd *cobra.Command, args []string) error {
 
 	g := git.NewGit(townRoot)
 	rigMgr := rig.NewManager(townRoot, rigsConfig, g)
-	t := tmux.NewTmux()
 
 	var successRigs []string
 	var failedRigs []string
@@ -1699,39 +1697,31 @@ func runRigStart(cmd *cobra.Command, args []string) error {
 		hasError := false
 
 		// 1. Start the witness
-		witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
-		witnessRunning, _ := t.HasSession(witnessSession)
-		if witnessRunning {
-			skipped = append(skipped, "witness")
-		} else {
-			fmt.Printf("  Starting witness...\n")
-			witMgr := witness.NewManager(r)
-			if err := witMgr.Start(false, "", nil); err != nil {
-				if err == witness.ErrAlreadyRunning {
-					skipped = append(skipped, "witness")
-				} else {
-					fmt.Printf("  %s Failed to start witness: %v\n", style.Warning.Render("⚠"), err)
-					hasError = true
-				}
+		// Start() treats healthy sessions as already running and recreates zombie
+		// sessions whose tmux pane remains after the agent exits.
+		witMgr := witness.NewManager(r)
+		if err := witMgr.Start(false, "", nil); err != nil {
+			if err == witness.ErrAlreadyRunning {
+				skipped = append(skipped, "witness")
 			} else {
-				started = append(started, "witness")
+				fmt.Printf("  %s Failed to start witness: %v\n", style.Warning.Render("⚠"), err)
+				hasError = true
 			}
+		} else {
+			started = append(started, "witness")
 		}
 
 		// 2. Start the refinery
-		refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
-		refineryRunning, _ := t.HasSession(refinerySession)
-		if refineryRunning {
-			skipped = append(skipped, "refinery")
-		} else {
-			fmt.Printf("  Starting refinery...\n")
-			refMgr := refinery.NewManager(r)
-			if err := refMgr.Start(false, ""); err != nil {
+		refMgr := refinery.NewManager(r)
+		if err := refMgr.Start(false, ""); err != nil {
+			if err == refinery.ErrAlreadyRunning {
+				skipped = append(skipped, "refinery")
+			} else {
 				fmt.Printf("  %s Failed to start refinery: %v\n", style.Warning.Render("⚠"), err)
 				hasError = true
-			} else {
-				started = append(started, "refinery")
 			}
+		} else {
+			started = append(started, "refinery")
 		}
 
 		// Report results for this rig
@@ -1905,10 +1895,112 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println()
 
+	// --- Parallel data gathering phase ---
+	// All expensive operations (tmux health checks, beads queries, git status)
+	// run concurrently. Display phase follows with pre-fetched data.
+	var dataWg sync.WaitGroup
+
 	// Witness status
-	fmt.Printf("%s\n", style.Bold.Render("Witness"))
 	witMgr := witness.NewManager(r)
-	witnessRunning, _ := witMgr.IsRunning()
+	var witnessRunning bool
+	dataWg.Add(1)
+	go func() {
+		defer dataWg.Done()
+		witnessRunning, _ = witMgr.IsRunning()
+	}()
+
+	// Refinery status + queue
+	refMgr := refinery.NewManager(r)
+	var refineryRunning bool
+	var refineryQueue []refinery.QueueItem
+	dataWg.Add(1)
+	go func() {
+		defer dataWg.Done()
+		refineryRunning, _ = refMgr.IsRunning()
+		if refineryRunning {
+			refineryQueue, _ = refMgr.Queue()
+		}
+	}()
+
+	// Polecats list (involves per-polecat beads + git queries)
+	polecatGit := git.NewGit(r.Path)
+	polecatMgr := polecat.NewManager(r, polecatGit, t)
+	var polecats []*polecat.Polecat
+	var polecatsErr error
+	dataWg.Add(1)
+	go func() {
+		defer dataWg.Done()
+		polecats, polecatsErr = polecatMgr.List()
+	}()
+
+	// Crew list
+	crewMgr := crew.NewManager(r, git.NewGit(townRoot))
+	var crewWorkers []*crew.CrewWorker
+	var crewErr error
+	dataWg.Add(1)
+	go func() {
+		defer dataWg.Done()
+		crewWorkers, crewErr = crewMgr.List()
+	}()
+
+	dataWg.Wait()
+
+	// --- Polecat + Crew session checks (parallel, after List completes) ---
+	type polecatInfo struct {
+		name       string
+		state      polecat.State
+		issue      string
+		hasSession bool
+	}
+	var pInfos []polecatInfo
+	type crewInfo struct {
+		name       string
+		hasSession bool
+		branch     string
+		dirty      bool
+	}
+	var cInfos []crewInfo
+
+	var sessionWg sync.WaitGroup
+
+	if polecatsErr == nil && len(polecats) > 0 {
+		pInfos = make([]polecatInfo, len(polecats))
+		for i, p := range polecats {
+			pInfos[i] = polecatInfo{name: p.Name, state: p.State, issue: p.Issue}
+			sessionWg.Add(1)
+			go func(idx int, p *polecat.Polecat) {
+				defer sessionWg.Done()
+				sessionName := session.PolecatSessionName(session.PrefixFor(rigName), p.Name)
+				pInfos[idx].hasSession = isAgentSessionHealthy(t, sessionName)
+			}(i, p)
+		}
+	}
+
+	if crewErr == nil && len(crewWorkers) > 0 {
+		cInfos = make([]crewInfo, len(crewWorkers))
+		for i, w := range crewWorkers {
+			cInfos[i] = crewInfo{name: w.Name}
+			sessionWg.Add(1)
+			go func(idx int, w *crew.CrewWorker) {
+				defer sessionWg.Done()
+				sessionName := crewSessionName(rigName, w.Name)
+				cInfos[idx].hasSession = isAgentSessionHealthy(t, sessionName)
+				crewGit := git.NewGit(w.ClonePath)
+				cInfos[idx].branch, _ = crewGit.CurrentBranch()
+				gitStatus, _ := crewGit.Status()
+				if gitStatus != nil && !gitStatus.Clean {
+					cInfos[idx].dirty = true
+				}
+			}(i, w)
+		}
+	}
+
+	sessionWg.Wait()
+
+	// --- Display phase (all data pre-fetched) ---
+
+	// Witness
+	fmt.Printf("%s\n", style.Bold.Render("Witness"))
 	if witnessRunning {
 		fmt.Printf("  %s running\n", style.Success.Render("●"))
 	} else {
@@ -1916,16 +2008,12 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println()
 
-	// Refinery status
+	// Refinery
 	fmt.Printf("%s\n", style.Bold.Render("Refinery"))
-	refMgr := refinery.NewManager(r)
-	refineryRunning, _ := refMgr.IsRunning()
 	if refineryRunning {
 		fmt.Printf("  %s running\n", style.Success.Render("●"))
-		// Show queue size
-		queue, err := refMgr.Queue()
-		if err == nil && len(queue) > 0 {
-			fmt.Printf("  Queue: %d items\n", len(queue))
+		if len(refineryQueue) > 0 {
+			fmt.Printf("  Queue: %d items\n", len(refineryQueue))
 		}
 	} else {
 		fmt.Printf("  %s stopped\n", style.Dim.Render("○"))
@@ -1933,20 +2021,14 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	// Polecats
-	polecatGit := git.NewGit(r.Path)
-	polecatMgr := polecat.NewManager(r, polecatGit, t)
-	polecats, err := polecatMgr.List()
 	fmt.Printf("%s", style.Bold.Render("Polecats"))
-	if err != nil || len(polecats) == 0 {
+	if polecatsErr != nil || len(polecats) == 0 {
 		fmt.Printf(" (none)\n")
 	} else {
 		fmt.Printf(" (%d)\n", len(polecats))
-		for _, p := range polecats {
-			sessionName := session.PolecatSessionName(session.PrefixFor(rigName), p.Name)
-			hasSession, _ := t.HasSession(sessionName)
-
+		for _, pi := range pInfos {
 			sessionIcon := style.Dim.Render("○")
-			if hasSession {
+			if pi.hasSession {
 				sessionIcon = style.Success.Render("●")
 			}
 
@@ -1957,51 +2039,41 @@ func runRigStatus(cmd *cobra.Command, args []string) error {
 			// witness can detect unsubmitted work (gt-3071b). Previously this
 			// showed "done" which masked failures where polecats died before
 			// running gt done, leaving work stranded in worktrees.
-			displayState := p.State
-			if hasSession && displayState == polecat.StateDone {
+			displayState := pi.state
+			if pi.hasSession && displayState == polecat.StateDone {
 				displayState = polecat.StateWorking
-			} else if !hasSession && displayState == polecat.StateWorking {
-				displayState = polecat.State("stalled")
+			} else if !pi.hasSession && displayState == polecat.StateWorking {
+				displayState = polecat.StateStalled
 			}
 
 			stateStr := string(displayState)
-			if p.Issue != "" {
-				stateStr = fmt.Sprintf("%s → %s", displayState, p.Issue)
+			if pi.issue != "" {
+				stateStr = fmt.Sprintf("%s → %s", displayState, pi.issue)
 			}
 
-			fmt.Printf("  %s %s: %s\n", sessionIcon, p.Name, stateStr)
+			fmt.Printf("  %s %s: %s\n", sessionIcon, pi.name, stateStr)
 		}
 	}
 	fmt.Println()
 
 	// Crew
-	crewMgr := crew.NewManager(r, git.NewGit(townRoot))
-	crewWorkers, err := crewMgr.List()
 	fmt.Printf("%s", style.Bold.Render("Crew"))
-	if err != nil || len(crewWorkers) == 0 {
+	if crewErr != nil || len(crewWorkers) == 0 {
 		fmt.Printf(" (none)\n")
 	} else {
 		fmt.Printf(" (%d)\n", len(crewWorkers))
-		for _, w := range crewWorkers {
-			sessionName := crewSessionName(rigName, w.Name)
-			hasSession, _ := t.HasSession(sessionName)
-
+		for _, ci := range cInfos {
 			sessionIcon := style.Dim.Render("○")
-			if hasSession {
+			if ci.hasSession {
 				sessionIcon = style.Success.Render("●")
 			}
 
-			// Get git info
-			crewGit := git.NewGit(w.ClonePath)
-			branch, _ := crewGit.CurrentBranch()
-			gitStatus, _ := crewGit.Status()
-
 			gitInfo := ""
-			if gitStatus != nil && !gitStatus.Clean {
+			if ci.dirty {
 				gitInfo = style.Warning.Render(" (dirty)")
 			}
 
-			fmt.Printf("  %s %s: %s%s\n", sessionIcon, w.Name, branch, gitInfo)
+			fmt.Printf("  %s %s: %s%s\n", sessionIcon, ci.name, ci.branch, gitInfo)
 		}
 	}
 
@@ -2195,37 +2267,29 @@ func runRigRestart(cmd *cobra.Command, args []string) error {
 		var skipped []string
 
 		// 1. Start the witness
-		witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
-		witnessRunning, _ := t.HasSession(witnessSession)
-		if witnessRunning {
-			skipped = append(skipped, "witness")
-		} else {
-			fmt.Printf("    Starting witness...\n")
-			if err := witMgr.Start(false, "", nil); err != nil {
-				if err == witness.ErrAlreadyRunning {
-					skipped = append(skipped, "witness")
-				} else {
-					fmt.Printf("    %s Failed to start witness: %v\n", style.Warning.Render("⚠"), err)
-					startErrors = append(startErrors, fmt.Sprintf("witness: %v", err))
-				}
+		// Start() treats healthy sessions as already running and recreates zombie
+		// sessions whose tmux pane remains after the agent exits.
+		if err := witMgr.Start(false, "", nil); err != nil {
+			if err == witness.ErrAlreadyRunning {
+				skipped = append(skipped, "witness")
 			} else {
-				started = append(started, "witness")
+				fmt.Printf("    %s Failed to start witness: %v\n", style.Warning.Render("⚠"), err)
+				startErrors = append(startErrors, fmt.Sprintf("witness: %v", err))
 			}
+		} else {
+			started = append(started, "witness")
 		}
 
 		// 2. Start the refinery
-		refinerySession := session.RefinerySessionName(session.PrefixFor(rigName))
-		refineryRunning, _ := t.HasSession(refinerySession)
-		if refineryRunning {
-			skipped = append(skipped, "refinery")
-		} else {
-			fmt.Printf("    Starting refinery...\n")
-			if err := refMgr.Start(false, ""); err != nil {
+		if err := refMgr.Start(false, ""); err != nil {
+			if err == refinery.ErrAlreadyRunning {
+				skipped = append(skipped, "refinery")
+			} else {
 				fmt.Printf("    %s Failed to start refinery: %v\n", style.Warning.Render("⚠"), err)
 				startErrors = append(startErrors, fmt.Sprintf("refinery: %v", err))
-			} else {
-				started = append(started, "refinery")
 			}
+		} else {
+			started = append(started, "refinery")
 		}
 
 		// Report results for this rig
@@ -2317,6 +2381,22 @@ func getRigOperationalState(townRoot, rigName string) (state string, source stri
 
 	// Default: operational
 	return "OPERATIONAL", "default"
+}
+
+// ensureHooksBase creates ~/.gt/hooks-base.json from current defaults if it
+// doesn't exist yet. Without this file, gt hooks diff has no reference point
+// and cannot detect drift when default hooks change after initial setup.
+// Non-fatal: missing base config is caught by gt doctor hooks-base-missing.
+func ensureHooksBase() {
+	if _, err := hooks.LoadBase(); err == nil {
+		return // already exists
+	}
+	base := hooks.DefaultBase()
+	if err := hooks.SaveBase(base); err != nil {
+		fmt.Fprintf(os.Stderr, "  Warning: could not create hooks-base.json: %v\n", err)
+		return
+	}
+	fmt.Printf("  Created hooks-base.json at %s\n", hooks.BasePath())
 }
 
 // syncRigHooks syncs hooks for a specific rig's targets after rig creation.

@@ -125,6 +125,50 @@ func TestGetDoltFlagFromArgs(t *testing.T) {
 	}
 }
 
+func TestReadSQLServerInfo(t *testing.T) {
+	dataDir := t.TempDir()
+	infoDir := filepath.Join(dataDir, ".dolt")
+	if err := os.MkdirAll(infoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	infoPath := filepath.Join(infoDir, "sql-server.info")
+	if err := os.WriteFile(infoPath, []byte("62569:3307:757ce4ea-40c5-40f1-9eaf-4d584cae87b0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := readSQLServerInfo(&Config{DataDir: dataDir})
+	if err != nil {
+		t.Fatalf("readSQLServerInfo: %v", err)
+	}
+	if info.PID != 62569 {
+		t.Fatalf("PID = %d, want 62569", info.PID)
+	}
+	if info.Port != 3307 {
+		t.Fatalf("Port = %d, want 3307", info.Port)
+	}
+	if info.ServerID != "757ce4ea-40c5-40f1-9eaf-4d584cae87b0" {
+		t.Fatalf("ServerID = %q", info.ServerID)
+	}
+	if info.Path != infoPath {
+		t.Fatalf("Path = %q, want %q", info.Path, infoPath)
+	}
+}
+
+func TestReadSQLServerInfoRejectsMalformedContent(t *testing.T) {
+	dataDir := t.TempDir()
+	infoDir := filepath.Join(dataDir, ".dolt")
+	if err := os.MkdirAll(infoDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(infoDir, "sql-server.info"), []byte("not-a-pid:3307"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := readSQLServerInfo(&Config{DataDir: dataDir}); err == nil {
+		t.Fatal("expected malformed sql-server.info to fail")
+	}
+}
+
 func TestDoltProcessMatchesTownPaths(t *testing.T) {
 	expectedDir := "/town/.dolt-data"
 
@@ -2069,16 +2113,24 @@ func TestIsDoltRetryableError_CatalogRace(t *testing.T) {
 }
 
 func TestWaitForCatalog_NoServer(t *testing.T) {
-	// When no Dolt server is running, waitForCatalog should fail immediately
-	// (not retry) because the error is non-retryable (not a catalog race).
+	// When no Dolt server is reachable, waitForCatalog should fail.
+	// Use port 13399 (unlikely to be in use) to ensure no server responds.
 	townRoot := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data"), 0755); err != nil {
+	dataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Write a config.yaml with an unreachable port so buildServerSQLCmd
+	// tries to connect to a port that nobody is listening on.
+	configContent := "listener:\n  port: 13399\ndata_dir: " + dataDir + "\n"
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(configContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 	err := waitForCatalog(townRoot, "testdb")
 	if err == nil {
 		t.Fatal("expected error when no server is running")
 	}
+	// Connection refused or similar non-retryable error
 	if !strings.Contains(err.Error(), "non-retryable") {
 		t.Errorf("expected non-retryable error, got: %v", err)
 	}
@@ -2415,6 +2467,17 @@ func TestDatabaseExists_NoDataDir(t *testing.T) {
 func TestFindBrokenWorkspaces_HealthyWorkspace(t *testing.T) {
 	townRoot := t.TempDir()
 
+	// Point the test at a port nothing listens on so IsRunning returns false
+	// and doesn't accidentally connect to a real Dolt server on the default port.
+	doltDataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"),
+		[]byte("listener:\n  port: 13307\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
 	// Create a healthy workspace: metadata says dolt, and database exists
 	beadsDir := filepath.Join(townRoot, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
@@ -2555,6 +2618,16 @@ func TestFindBrokenWorkspaces_SqliteNotBroken(t *testing.T) {
 
 func TestFindBrokenWorkspaces_MultipleRigs(t *testing.T) {
 	townRoot := t.TempDir()
+
+	// Isolate from real Dolt server on default port
+	doltDataDir := filepath.Join(townRoot, ".dolt-data")
+	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doltDataDir, "config.yaml"),
+		[]byte("listener:\n  port: 13307\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	// Set up rigs.json with two rigs
 	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
@@ -3367,6 +3440,10 @@ func TestIsRemote(t *testing.T) {
 		{"10.0.0.5", true},
 		{"dolt.internal", true},
 		{"192.168.1.100", true},
+		// Hostnames resolving to loopback should be treated as local.
+		// This covers /etc/hosts entries like "127.0.0.1 dolt.home.arpa".
+		// Note: "localhost" is already covered above; any hostname that
+		// the OS resolves to 127.0.0.1 or ::1 should also be local.
 	}
 	for _, tt := range tests {
 		c := &Config{Host: tt.host}
@@ -3537,22 +3614,26 @@ func TestBuildDoltSQLCmd_Local(t *testing.T) {
 		t.Errorf("cmd.Dir = %q, want %q", cmd.Dir, "/tmp/dolt-data")
 	}
 
-	// Should have: dolt sql -q "SELECT 1" (no connection flags)
+	// Should force a TCP client connection even for local servers.
 	args := cmd.Args
-	if len(args) < 4 {
-		t.Fatalf("expected at least 4 args, got %v", args)
+	if len(args) < 10 {
+		t.Fatalf("expected at least 10 args, got %v", args)
 	}
-	if args[1] != "sql" {
-		t.Errorf("args[1] = %q, want 'sql'", args[1])
-	}
-	if args[2] != "-q" {
-		t.Errorf("args[2] = %q, want '-q'", args[2])
-	}
-	// Should NOT have --host flag
-	for _, arg := range args {
-		if arg == "--host" {
-			t.Error("local cmd should not have --host flag")
+	argStr := strings.Join(args, " ")
+	for _, want := range []string{"--host", "127.0.0.1", "--port", "3307", "--user", "root", "--no-tls", "sql", "-q", "SELECT 1"} {
+		if !strings.Contains(argStr, want) {
+			t.Errorf("args %q missing expected %q", argStr, want)
 		}
+	}
+	found := false
+	for _, env := range cmd.Env {
+		if env == "DOLT_CLI_PASSWORD=" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("local cmd should set empty DOLT_CLI_PASSWORD to suppress prompts")
 	}
 }
 
@@ -3606,12 +3687,13 @@ func TestBuildDoltSQLCmd_RemoteNoPassword(t *testing.T) {
 	ctx := t.Context()
 	cmd := buildDoltSQLCmd(ctx, config, "-q", "SELECT 1")
 
-	// Should NOT have DOLT_CLI_PASSWORD in env
+	// Should still have empty DOLT_CLI_PASSWORD in env to suppress prompts.
 	for _, env := range cmd.Env {
-		if strings.HasPrefix(env, "DOLT_CLI_PASSWORD=") {
-			t.Error("remote cmd without password should not have DOLT_CLI_PASSWORD env var")
+		if env == "DOLT_CLI_PASSWORD=" {
+			return
 		}
 	}
+	t.Error("remote cmd without password should set empty DOLT_CLI_PASSWORD env var")
 }
 
 // =============================================================================

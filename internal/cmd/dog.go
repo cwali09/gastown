@@ -299,8 +299,14 @@ func init() {
 }
 
 // getDogManager creates a dog.Manager with the current town root.
+//
+// Use FindFromCwdOrError so we honor GT_TOWN_ROOT/GT_ROOT env vars when
+// invoked from a dog worktree (e.g. ~/gt/deacon/dogs/alpha/<rig>/), where
+// FindFromCwd alone might walk up to a non-town ancestor or stop at a path
+// without mayor/rigs.json — which previously broke `gt dog done` and
+// blocked DOG_DONE delivery (hq-zyvo).
 func getDogManager() (*dog.Manager, error) {
-	townRoot, err := workspace.FindFromCwd()
+	townRoot, err := workspace.FindFromCwdOrError()
 	if err != nil {
 		return nil, fmt.Errorf("finding town root: %w", err)
 	}
@@ -669,6 +675,11 @@ func runDogDone(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("getting dog %s: %w", name, err)
 	}
 
+	// Always close accumulated plugin mails, even if dog is already idle.
+	// Plugin dispatch mails accumulate across sessions and must be cleaned up
+	// regardless of current work state.
+	closePluginMails(name)
+
 	if d.State == dog.StateIdle && d.Work == "" {
 		fmt.Printf("Dog %s is already idle with no work\n", name)
 		return nil
@@ -718,6 +729,47 @@ func splitPathComponents(path string) []string {
 	return strings.FieldsFunc(path, func(r rune) bool {
 		return r == '/' || r == '\\'
 	})
+}
+
+// closePluginMails archives all open "Plugin: " dispatch mails from a dog's inbox.
+// Plugin dispatch mails sent by the daemon accumulate because gt dog done never
+// closed them. On every UserPromptSubmit hook, gt mail check --inject re-injects
+// ALL open mails, causing context to balloon. This function cleans up eagerly.
+// It is best-effort: failures are logged but do not prevent dog from going idle.
+func closePluginMails(dogName string) {
+	townRoot, err := workspace.FindFromCwd()
+	if err != nil {
+		return // not in a Gas Town workspace, skip cleanup
+	}
+
+	dogAddress := fmt.Sprintf("deacon/dogs/%s", dogName)
+	router := mail.NewRouterWithTownRoot(townRoot, townRoot)
+	mailbox, err := router.GetMailbox(dogAddress)
+	if err != nil {
+		return
+	}
+
+	messages, err := mailbox.List()
+	if err != nil {
+		return
+	}
+
+	closed := 0
+	for _, msg := range messages {
+		if msg.Read {
+			continue
+		}
+		if !strings.HasPrefix(msg.Subject, "Plugin: ") {
+			continue
+		}
+		if archErr := mailbox.Archive(msg.ID); archErr == nil {
+			closed++
+		}
+	}
+
+	if closed > 0 {
+		fmt.Printf("  Closed %d stale plugin mail(s) from inbox\n", closed)
+	}
 }
 
 func runDogStatus(cmd *cobra.Command, args []string) error {

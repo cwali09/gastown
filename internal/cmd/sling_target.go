@@ -51,7 +51,23 @@ func sessionToAgentID(sessionName string) string {
 		// Fallback for unparseable sessions
 		return sessionName
 	}
-	return identity.Address()
+	return canonicalAssigneeAddress(identity)
+}
+
+// canonicalAssigneeAddress returns the address used for bead assignees and
+// hook-status queries. This matches the form emitted by resolveSelfTarget and
+// buildAgentIdentity: town-level agents (mayor, deacon) get a trailing slash.
+// session.AgentIdentity.Address() returns the bare name for those roles, which
+// causes the read/write mismatch in GH#3699.
+func canonicalAssigneeAddress(identity *session.AgentIdentity) string {
+	addr := identity.Address()
+	switch identity.Role {
+	case session.RoleMayor, session.RoleDeacon:
+		if !strings.HasSuffix(addr, "/") {
+			return addr + "/"
+		}
+	}
+	return addr
 }
 
 // resolveSelfTarget determines agent identity, pane, and hook root for slinging to self.
@@ -105,11 +121,12 @@ type ResolveTargetOptions struct {
 	Account  string
 	Agent    string
 	NoBoot   bool
-	HookBead   string // Bead ID to set atomically during polecat spawn (empty = skip)
-	BeadID     string // For cross-rig guard checks (empty = skip guard)
-	TownRoot   string
-	WorkDesc   string // Description for dog dispatch (defaults to HookBead if empty)
-	BaseBranch string // Override base branch for polecat worktree
+	HookBead     string // Bead ID to set atomically during polecat spawn (empty = skip)
+	BeadID       string // For cross-rig guard checks (empty = skip guard)
+	TownRoot     string
+	WorkDesc     string // Description for dog dispatch (defaults to HookBead if empty)
+	BaseBranch   string // Override base branch for polecat worktree
+	ResumeBranch string // Existing branch to resume (e.g. PR head); mutually exclusive with BaseBranch
 }
 
 // ResolvedTarget holds the results of target resolution.
@@ -208,12 +225,13 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 		}
 		fmt.Printf("Target is rig '%s', spawning fresh polecat...\n", rigName)
 		spawnOpts := SlingSpawnOptions{
-			Force:      opts.Force,
-			Account:    opts.Account,
-			Create:     opts.Create,
-			HookBead:   opts.HookBead,
-			Agent:      opts.Agent,
-			BaseBranch: opts.BaseBranch,
+			Force:        opts.Force,
+			Account:      opts.Account,
+			Create:       opts.Create,
+			HookBead:     opts.HookBead,
+			Agent:        opts.Agent,
+			BaseBranch:   opts.BaseBranch,
+			ResumeBranch: opts.ResumeBranch,
 		}
 		spawnInfo, err := spawnPolecatForSling(rigName, spawnOpts)
 		if err != nil {
@@ -245,12 +263,13 @@ func resolveTarget(target string, opts ResolveTargetOptions) (*ResolvedTarget, e
 				}
 				fmt.Printf("Target polecat has no active session, spawning fresh polecat in rig '%s'...\n", rigName)
 				spawnOpts := SlingSpawnOptions{
-					Force:      opts.Force,
-					Account:    opts.Account,
-					Create:     opts.Create,
-					HookBead:   opts.HookBead,
-					Agent:      opts.Agent,
-					BaseBranch: opts.BaseBranch,
+					Force:        opts.Force,
+					Account:      opts.Account,
+					Create:       opts.Create,
+					HookBead:     opts.HookBead,
+					Agent:        opts.Agent,
+					BaseBranch:   opts.BaseBranch,
+					ResumeBranch: opts.ResumeBranch,
 				}
 				spawnInfo, spawnErr := spawnPolecatForSling(rigName, spawnOpts)
 				if spawnErr != nil {
